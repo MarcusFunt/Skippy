@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+.DS_Store
+
+# App runtime
+data/
+recordings/
+logs/
+
+# Models (keep folder, ignore heavy files)
+models/**
+!models/.gitkeep
+!models/README.md
+
+# IDE
+.vscode/
+.idea/
