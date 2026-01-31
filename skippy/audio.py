@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import numpy as np
@@ -31,27 +32,31 @@ class Recorder:
     device: Optional[int] = None
     max_seconds: int = 30
 
-    _frames: list = None
+    _frames: list = field(default_factory=list)
     _stream: Optional[sd.InputStream] = None
     _start_time: float = 0.0
     _running: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def start(self) -> None:
-        if self._running:
-            return
-        self._frames = []
-        self._start_time = time.time()
-        self._running = True
+        with self._lock:
+            if self._running:
+                return
+            self._frames = []
+            self._start_time = time.time()
+            self._running = True
 
         def callback(indata, frames, time_info, status):
             if status:
                 # Avoid noisy prints in callback; callers can handle debug if desired.
                 pass
-            if not self._running:
-                return
-            self._frames.append(indata.copy())
-            if time.time() - self._start_time >= self.max_seconds:
-                self.stop()
+            with self._lock:
+                if not self._running:
+                    return
+                # Stop appending if max_seconds reached
+                if time.time() - self._start_time >= self.max_seconds:
+                    return
+                self._frames.append(indata.copy())
 
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
@@ -63,9 +68,11 @@ class Recorder:
         self._stream.start()
 
     def stop(self) -> bytes:
-        if not self._running:
-            return b""
-        self._running = False
+        with self._lock:
+            if not self._running:
+                return b""
+            self._running = False
+
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -74,10 +81,12 @@ class Recorder:
                 logging.error(f"Error stopping audio stream: {e}")
             self._stream = None
 
-        if not self._frames:
-            audio = np.zeros((0, self.channels), dtype=np.float32)
-        else:
-            audio = np.concatenate(self._frames, axis=0)
+        with self._lock:
+            if not self._frames:
+                audio = np.zeros((0, self.channels), dtype=np.float32)
+            else:
+                audio = np.concatenate(self._frames, axis=0)
+            self._frames = []
 
         buf = io.BytesIO()
         # Whisper works well with 16k PCM16 WAV
@@ -128,8 +137,10 @@ def decode_audio_bytes(data: bytes) -> Tuple[np.ndarray, int]:
         ) from e
 
 
-def play_audio(data: bytes, device: Optional[int] = None) -> None:
+def play_audio(data: bytes, device: Optional[int] = None, volume: float = 1.0) -> None:
     arr, sr = decode_audio_bytes(data)
+    if volume != 1.0:
+        arr = arr * volume
     sd.play(arr, sr, device=device)
     sd.wait()
 

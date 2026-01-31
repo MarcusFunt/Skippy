@@ -7,3 +7,4 @@ pynput>=1.7.7
 tomli>=2.0.1; python_version < "3.11"
 sseclient-py>=1.8.0
 pydub>=0.25.1
+tomli-w>=1.0.0

@@ -119,12 +119,14 @@ class SkippyApp:
             if self.state.busy:
                 return
         self.recorder.start()
+        self._enqueue("ptt_active", True)
         self._set_status("Recording… release to send")
 
     def ptt_stop(self) -> None:
         with self._lock:
             if self.state.busy:
                 return
+        self._enqueue("ptt_active", False)
         wav_bytes = self.recorder.stop()
         if not wav_bytes:
             self._set_status("No audio captured")
@@ -146,7 +148,19 @@ class SkippyApp:
 
     def _process_turn(self, wav_bytes: bytes) -> None:
         try:
-            user_text = self.client.transcribe(wav_bytes, model=self.cfg.models.stt)
+            with self._lock:
+                stt_model = self.cfg.models.stt
+                llm_model = self.cfg.models.llm
+                tts_model = self.cfg.models.tts
+                tts_endpoint = self.cfg.models.tts_endpoint
+                tts_extra_params = dict(self.cfg.tts.extra_params)
+                tts_response_format = self.cfg.tts.response_format
+                out_device = self.out_device
+                volume = self.cfg.audio.volume
+                stream = self.state.stream
+                temp = self.state.temperature
+
+            user_text = self.client.transcribe(wav_bytes, model=stt_model)
             user_text = (user_text or "").strip()
             if not user_text:
                 self._set_status("Transcription was empty")
@@ -161,14 +175,11 @@ class SkippyApp:
             assistant_text = ""
 
             messages = self._get_messages()
-            with self._lock:
-                stream = self.state.stream
-                temp = self.state.temperature
 
             if stream:
                 self._enqueue("assistant_new_stream", None)
                 for chunk in self.client.chat_stream(
-                    model=self.cfg.models.llm,
+                    model=llm_model,
                     messages=messages,
                     temperature=temp,
                 ):
@@ -183,7 +194,7 @@ class SkippyApp:
                     self._enqueue("assistant_finalize_stream", assistant_text)
             else:
                 assistant_text = self.client.chat(
-                    model=self.cfg.models.llm,
+                    model=llm_model,
                     messages=messages,
                     temperature=temp,
                 )
@@ -200,13 +211,21 @@ class SkippyApp:
 
             # TTS
             self._set_status("Speaking…")
-            tts_bytes = self._tts_bytes(assistant_text)
+            if tts_endpoint.lower() == "openai":
+                voice = str(tts_extra_params.get("voice", "alloy"))
+                tts_bytes = self.client.tts_openai(
+                    tts_model, text=assistant_text, voice=voice, response_format=tts_response_format
+                )
+            else:
+                tts_bytes = self.client.tts_raw(
+                    tts_model, text=assistant_text, extra_params=tts_extra_params
+                )
 
             with self._lock:
                 if self.state.cancel_flag:
                     return
 
-            play_audio(tts_bytes, device=self.out_device)
+            play_audio(tts_bytes, device=out_device, volume=volume)
             self._set_status("Ready")
         except Exception as e:
             self._set_status(f"Error: {e}")
@@ -214,15 +233,6 @@ class SkippyApp:
             with self._lock:
                 self.state.busy = False
             self._set_busy(False)
-
-    def _tts_bytes(self, text: str) -> bytes:
-        if self.cfg.models.tts_endpoint.lower() == "openai":
-            # OpenAI-compatible endpoint (may return wav depending on LocalAI version/config)
-            voice = str(self.cfg.tts.extra_params.get("voice", "alloy"))
-            fmt = self.cfg.tts.response_format or None
-            return self.client.tts_openai(self.cfg.models.tts, text=text, voice=voice, response_format=fmt)
-        # Default: LocalAI /tts endpoint (commonly WAV)
-        return self.client.tts_raw(self.cfg.models.tts, text=text, extra_params=self.cfg.tts.extra_params)
 
     # ---------------- UI build ----------------
     def build(self) -> None:
@@ -241,8 +251,8 @@ class SkippyApp:
         # Global key handlers for PTT
         ptt = _keycode(self.cfg.audio.ptt_key)
         with dpg.handler_registry():
-            dpg.add_key_down_handler(key=ptt, callback=lambda: self.ptt_start(), tag="ptt_down")
-            dpg.add_key_release_handler(key=ptt, callback=lambda: self.ptt_stop(), tag="ptt_up")
+            dpg.add_key_press_handler(key=ptt, callback=lambda: self.ptt_start())
+            dpg.add_key_release_handler(key=ptt, callback=lambda: self.ptt_stop())
 
         # UI tick
         dpg.set_render_callback(self._tick)
@@ -278,6 +288,12 @@ class SkippyApp:
 
         dpg.bind_theme(theme)
 
+        with dpg.theme() as self.recording_theme:
+            with dpg.theme_component(dpg.mvButton):
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (200, 50, 50))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHover, (230, 70, 70))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (150, 30, 30))
+
     def _setup_light_theme(self) -> None:
         with dpg.theme() as theme:
             with dpg.theme_component(dpg.mvAll):
@@ -311,6 +327,7 @@ class SkippyApp:
         with dpg.menu_bar():
             with dpg.menu(label="File"):
                 dpg.add_menu_item(label="Reload config", callback=self._reload_config)
+                dpg.add_menu_item(label="Save config", callback=self._save_config_callback)
                 dpg.add_menu_item(label="Exit", callback=lambda: dpg.stop_dearpygui())
             with dpg.menu(label="Tools"):
                 dpg.add_menu_item(label="Refresh models", callback=lambda: self.refresh_models())
@@ -333,8 +350,10 @@ class SkippyApp:
                     self.ids["busy"] = dpg.add_text("")
 
                 with dpg.group(horizontal=True):
-                    self.ids["ptt_btn"] = dpg.add_button(label="Hold to talk (or use hotkey)", width=360)
+                    self.ids["ptt_btn"] = dpg.add_button(label="Hold to talk (or use hotkey)", width=300)
                     dpg.bind_item_handler_registry(self.ids["ptt_btn"], self._ptt_mouse_handlers())
+                    dpg.add_text("Vol")
+                    self.ids["volume_slider"] = dpg.add_slider_float(default_value=self.cfg.audio.volume, min_value=0.0, max_value=2.0, width=120, callback=self._set_volume)
                     self.ids["cancel_btn"] = dpg.add_button(label="Cancel", width=120, callback=lambda: self.cancel())
                     self.ids["clear_btn"] = dpg.add_button(label="Clear", width=80, callback=lambda: self._clear_conv_callback())
                     with self._lock:
@@ -345,7 +364,10 @@ class SkippyApp:
 
             # RIGHT: settings
             with dpg.child_window(width=-1, height=-1, border=True):
-                dpg.add_text("Settings")
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Settings")
+                    dpg.add_spacer(width=200)
+                    dpg.add_button(label="Save current as default", callback=self._save_config_callback)
                 dpg.add_separator()
                 dpg.add_text("LocalAI")
                 self.ids["base_url"] = dpg.add_input_text(label="Base URL", default_value=self.cfg.localai.base_url, readonly=True, width=-1)
@@ -405,24 +427,34 @@ class SkippyApp:
             self.state.temperature = float(app_data)
 
     def _set_llm(self, sender, app_data):
-        self.cfg.models.llm = str(app_data)
+        with self._lock:
+            self.cfg.models.llm = str(app_data)
 
     def _set_stt(self, sender, app_data):
-        self.cfg.models.stt = str(app_data)
+        with self._lock:
+            self.cfg.models.stt = str(app_data)
 
     def _set_tts(self, sender, app_data):
-        self.cfg.models.tts = str(app_data)
+        with self._lock:
+            self.cfg.models.tts = str(app_data)
 
     def _set_tts_endpoint(self, sender, app_data):
-        self.cfg.models.tts_endpoint = str(app_data)
+        with self._lock:
+            self.cfg.models.tts_endpoint = str(app_data)
 
     def _set_device_in(self, sender, app_data):
-        self.cfg.audio.device_in = str(app_data)
-        self.recorder.device = device_by_name(self.cfg.audio.device_in, kind="input")
+        with self._lock:
+            self.cfg.audio.device_in = str(app_data)
+            self.recorder.device = device_by_name(self.cfg.audio.device_in, kind="input")
 
     def _set_device_out(self, sender, app_data):
-        self.cfg.audio.device_out = str(app_data)
-        self.out_device = device_by_name(self.cfg.audio.device_out, kind="output")
+        with self._lock:
+            self.cfg.audio.device_out = str(app_data)
+            self.out_device = device_by_name(self.cfg.audio.device_out, kind="output")
+
+    def _set_volume(self, sender, app_data):
+        with self._lock:
+            self.cfg.audio.volume = float(app_data)
 
     def _get_device_names(self) -> Dict[str, List[str]]:
         import sounddevice as sd
@@ -489,6 +521,18 @@ class SkippyApp:
             self._set_status(f"Config reload error: {e}")
             self._show_error("Config Reload Error", str(e))
 
+    def _save_config_callback(self) -> None:
+        if not self.cfg.config_path:
+            self._set_status("No config path set")
+            return
+        try:
+            with self._lock:
+                self.cfg.save()
+            self._set_status(f"Config saved to {self.cfg.config_path.name}")
+        except Exception as e:
+            self._set_status(f"Config save error: {e}")
+            self._show_error("Config Save Error", str(e))
+
     def _error_modal(self, title: str, message: str) -> None:
         win_id = dpg.generate_uuid()
         with dpg.window(
@@ -543,12 +587,20 @@ class SkippyApp:
             elif op == "models_list":
                 models: List[str] = payload
                 # Populate combos with fetched models, keep current if possible
-                for key, cur in [("llm_combo", self.cfg.models.llm), ("stt_combo", self.cfg.models.stt), ("tts_combo", self.cfg.models.tts)]:
-                    dpg.configure_item(self.ids[key], items=models)
-                    if cur in models:
-                        dpg.set_value(self.ids[key], cur)
-                    elif models:
-                        dpg.set_value(self.ids[key], models[0])
+                with self._lock:
+                    combos = [
+                        ("llm_combo", self.cfg.models.llm, "llm"),
+                        ("stt_combo", self.cfg.models.stt, "stt"),
+                        ("tts_combo", self.cfg.models.tts, "tts"),
+                    ]
+                    for key, cur, attr in combos:
+                        dpg.configure_item(self.ids[key], items=models)
+                        if cur in models:
+                            dpg.set_value(self.ids[key], cur)
+                        elif models:
+                            new_val = models[0]
+                            dpg.set_value(self.ids[key], new_val)
+                            setattr(self.cfg.models, attr, new_val)
                 dpg.set_value(self.ids["models_hint"], f"{len(models)} models")
             elif op == "assistant_new_stream":
                 self._start_stream_bubble()
@@ -558,6 +610,13 @@ class SkippyApp:
                 self._finalize_stream_bubble(str(payload))
             elif op == "error_modal":
                 self._error_modal(payload["title"], payload["message"])
+            elif op == "ptt_active":
+                if payload:
+                    dpg.bind_item_theme(self.ids["ptt_btn"], self.recording_theme)
+                    dpg.configure_item(self.ids["ptt_btn"], label="RECORDING...")
+                else:
+                    dpg.bind_item_theme(self.ids["ptt_btn"], 0)
+                    dpg.configure_item(self.ids["ptt_btn"], label="Hold to talk (or use hotkey)")
 
     def _append_chat_bubble(self, who: str, text: str) -> None:
         parent = self.ids["chat_log"]
@@ -596,5 +655,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         dpg.start_dearpygui()
     finally:
+        stop_playback()
         dpg.destroy_context()
     return 0
