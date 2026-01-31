@@ -1,0 +1,9 @@
+dearpygui>=1.11.1
+requests>=2.31.0
+numpy>=1.26.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+pynput>=1.7.7
+tomli>=2.0.1; python_version < "3.11"
+sseclient-py>=1.8.0
+pydub>=0.25.1

@@ -1,0 +1,35 @@
+[localai]
+base_url = "http://localhost:8080"
+timeout_s = 180
+
+[models]
+# These names match LocalAI AIO defaults (you can override to your installed models)
+llm = "gpt-4"
+stt = "whisper-1"
+# For TTS, this app defaults to the /tts endpoint (recommended for WAV)
+tts = "vibevoice"
+# If you prefer OpenAI-compatible /v1/audio/speech, set tts_endpoint="openai"
+tts_endpoint = "tts"  # "tts" or "openai"
+
+[tts]
+# Optional extra parameters passed to LocalAI. Leave empty unless you know your TTS backend supports them.
+# Examples (backend-dependent): voice, speaker, speed, language, temperature, etc.
+extra_params = { }
+# If using /v1/audio/speech and your LocalAI build supports it, you can request a format.
+response_format = "wav" # wav|mp3|opus|aac|flac|pcm (may be ignored depending on LocalAI version)
+
+[audio]
+sample_rate = 16000
+channels = 1
+device_in = ""   # empty = default
+device_out = ""  # empty = default
+ptt_key = "SHIFT_R"  # SHIFT_R, SPACE, F9, etc.
+max_record_seconds = 30
+
+[ui]
+theme = "dark"
+font_size = 17
+show_debug = false
+
+[persona]
+persona_file = "config/personas/engineer.md"

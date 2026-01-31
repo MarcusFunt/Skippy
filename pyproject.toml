@@ -1,0 +1,11 @@
+[project]
+name = "skippy"
+version = "0.1.0"
+description = "LocalAI speech-to-speech push-to-talk desktop app (DearPyGUI)"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name="Skippy Contributors"}]
+
+[tool.ruff]
+line-length = 100
