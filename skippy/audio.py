@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -69,8 +70,8 @@ class Recorder:
             try:
                 self._stream.stop()
                 self._stream.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logging.error(f"Error stopping audio stream: {e}")
             self._stream = None
 
         if not self._frames:
@@ -97,12 +98,15 @@ def decode_audio_bytes(data: bytes) -> Tuple[np.ndarray, int]:
     try:
         arr, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
         return arr, sr
-    except Exception:
-        pass
+    except Exception as e:
+        logging.debug(f"soundfile decoding failed: {e}")
 
     # Fallback: pydub (requires ffmpeg installed on system)
     try:
-        from pydub import AudioSegment  # type: ignore
+        try:
+            from pydub import AudioSegment  # type: ignore
+        except ImportError:
+            raise RuntimeError("pydub not installed. Please install with 'pip install pydub'.")
 
         seg = AudioSegment.from_file(io.BytesIO(data))
         sr = seg.frame_rate
@@ -119,7 +123,7 @@ def decode_audio_bytes(data: bytes) -> Tuple[np.ndarray, int]:
         return arr, sr
     except Exception as e:
         raise RuntimeError(
-            "Could not decode audio bytes. If your TTS returns mp3/opus, install ffmpeg "
+            f"Could not decode audio bytes: {e}. If your TTS returns mp3/opus, install ffmpeg "
             "and ensure pydub can find it, or switch LocalAI to return WAV (recommended)."
         ) from e
 
@@ -128,3 +132,11 @@ def play_audio(data: bytes, device: Optional[int] = None) -> None:
     arr, sr = decode_audio_bytes(data)
     sd.play(arr, sr, device=device)
     sd.wait()
+
+
+def stop_playback() -> None:
+    """Stop any ongoing sounddevice playback."""
+    try:
+        sd.stop()
+    except Exception:
+        pass

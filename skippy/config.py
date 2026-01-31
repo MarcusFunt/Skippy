@@ -76,7 +76,15 @@ def _get(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
 
 def load_config(path: str | Path) -> AppConfig:
     p = Path(path).expanduser().resolve()
-    data = tomllib.loads(p.read_text(encoding="utf-8"))
+    try:
+        content = p.read_text(encoding="utf-8")
+        data = tomllib.loads(content)
+    except FileNotFoundError:
+        print(f"Config file not found: {p}. Using defaults.")
+        data = {}
+    except Exception as e:
+        print(f"Error loading config {p}: {e}. Using defaults.")
+        data = {}
 
     cfg = AppConfig()
     cfg.root_dir = p.parent

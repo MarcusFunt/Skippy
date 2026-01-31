@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import dearpygui.dearpygui as dpg
 
-from .audio import Recorder, device_by_name, play_audio
+from .audio import Recorder, device_by_name, play_audio, stop_playback
 from .config import AppConfig, load_config, read_persona_text
 from .localai_client import LocalAIClient
 
@@ -68,6 +68,8 @@ class SkippyApp:
         # DPG item ids
         self.ids: Dict[str, int] = {}
 
+        self._lock = threading.Lock()
+
     # ---------------- UI helpers ----------------
     def _enqueue(self, op: str, payload: Any) -> None:
         self.ui_queue.put((op, payload))
@@ -79,11 +81,26 @@ class SkippyApp:
     def _set_status(self, text: str) -> None:
         self._enqueue("status", text)
 
+    def _show_error(self, title: str, message: str) -> None:
+        self._enqueue("error_modal", {"title": title, "message": message})
+
     def _set_busy(self, busy: bool) -> None:
         self._enqueue("busy", busy)
 
     def _set_assistant_stream_text(self, text: str) -> None:
         self._enqueue("assistant_stream", text)
+
+    def _get_messages(self) -> List[Dict[str, str]]:
+        with self._lock:
+            return list(self.state.messages)
+
+    def _append_message(self, role: str, content: str) -> None:
+        with self._lock:
+            self.state.messages.append({"role": role, "content": content})
+
+    def _clear_messages(self) -> None:
+        with self._lock:
+            self.state.messages = [{"role": "system", "content": self.persona_text}]
 
     # ---------------- Model ops ----------------
     def refresh_models(self) -> None:
@@ -98,28 +115,33 @@ class SkippyApp:
 
     # ---------------- Audio / PTT ----------------
     def ptt_start(self) -> None:
-        if self.state.busy:
-            return
+        with self._lock:
+            if self.state.busy:
+                return
         self.recorder.start()
         self._set_status("Recording… release to send")
 
     def ptt_stop(self) -> None:
-        if self.state.busy:
-            return
+        with self._lock:
+            if self.state.busy:
+                return
         wav_bytes = self.recorder.stop()
         if not wav_bytes:
             self._set_status("No audio captured")
             return
 
-        self.state.busy = True
-        self.state.cancel_flag = False
+        with self._lock:
+            self.state.busy = True
+            self.state.cancel_flag = False
         self._set_busy(True)
         self._set_status("Transcribing…")
 
         threading.Thread(target=self._process_turn, args=(wav_bytes,), daemon=True).start()
 
     def cancel(self) -> None:
-        self.state.cancel_flag = True
+        with self._lock:
+            self.state.cancel_flag = True
+        stop_playback()
         self._set_status("Cancel requested…")
 
     def _process_turn(self, wav_bytes: bytes) -> None:
@@ -132,21 +154,27 @@ class SkippyApp:
 
             # Add user message
             self._add_log("You", user_text)
-            self.state.messages.append({"role": "user", "content": user_text})
+            self._append_message("user", user_text)
 
             # LLM
             self._set_status("Thinking…")
             assistant_text = ""
 
-            if self.state.stream:
+            messages = self._get_messages()
+            with self._lock:
+                stream = self.state.stream
+                temp = self.state.temperature
+
+            if stream:
                 self._enqueue("assistant_new_stream", None)
                 for chunk in self.client.chat_stream(
                     model=self.cfg.models.llm,
-                    messages=self.state.messages,
-                    temperature=self.state.temperature,
+                    messages=messages,
+                    temperature=temp,
                 ):
-                    if self.state.cancel_flag:
-                        break
+                    with self._lock:
+                        if self.state.cancel_flag:
+                            break
                     assistant_text += chunk
                     self._set_assistant_stream_text(assistant_text)
                 assistant_text = assistant_text.strip()
@@ -156,32 +184,35 @@ class SkippyApp:
             else:
                 assistant_text = self.client.chat(
                     model=self.cfg.models.llm,
-                    messages=self.state.messages,
-                    temperature=self.state.temperature,
+                    messages=messages,
+                    temperature=temp,
                 )
-                if self.state.cancel_flag:
-                    return
+                with self._lock:
+                    if self.state.cancel_flag:
+                        return
                 self._add_log("Skippy", assistant_text)
 
             if not assistant_text:
                 self._set_status("No assistant response")
                 return
 
-            self.state.messages.append({"role": "assistant", "content": assistant_text})
+            self._append_message("assistant", assistant_text)
 
             # TTS
             self._set_status("Speaking…")
             tts_bytes = self._tts_bytes(assistant_text)
 
-            if self.state.cancel_flag:
-                return
+            with self._lock:
+                if self.state.cancel_flag:
+                    return
 
             play_audio(tts_bytes, device=self.out_device)
             self._set_status("Ready")
         except Exception as e:
             self._set_status(f"Error: {e}")
         finally:
-            self.state.busy = False
+            with self._lock:
+                self.state.busy = False
             self._set_busy(False)
 
     def _tts_bytes(self, text: str) -> bytes:
@@ -227,6 +258,10 @@ class SkippyApp:
         dpg.bind_font(default_font)
 
     def _setup_theme(self) -> None:
+        if self.cfg.ui.theme.lower() == "light":
+            self._setup_light_theme()
+            return
+
         # Modern-ish dark theme
         with dpg.theme() as theme:
             with dpg.theme_component(dpg.mvAll):
@@ -243,6 +278,35 @@ class SkippyApp:
 
         dpg.bind_theme(theme)
 
+    def _setup_light_theme(self) -> None:
+        with dpg.theme() as theme:
+            with dpg.theme_component(dpg.mvAll):
+                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 8)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 8)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 14, 12)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 10, 8)
+                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 10, 10)
+
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (240, 240, 240))
+                dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (225, 225, 225))
+                dpg.add_theme_color(dpg.mvThemeCol_PopupBg, (240, 240, 240))
+                dpg.add_theme_color(dpg.mvThemeCol_Border, (180, 180, 180))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (255, 255, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgHover, (230, 230, 230))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (210, 210, 210))
+                dpg.add_theme_color(dpg.mvThemeCol_TitleBg, (200, 200, 200))
+                dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, (180, 180, 180))
+                dpg.add_theme_color(dpg.mvThemeCol_MenuBarBg, (220, 220, 220))
+                dpg.add_theme_color(dpg.mvThemeCol_Text, (0, 0, 0))
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (200, 200, 200))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHover, (180, 180, 180))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (160, 160, 160))
+                dpg.add_theme_color(dpg.mvThemeCol_Header, (200, 200, 200))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderHover, (180, 180, 180))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, (160, 160, 160))
+
+        dpg.bind_theme(theme)
+
     def _build_menu(self) -> None:
         with dpg.menu_bar():
             with dpg.menu(label="File"):
@@ -251,6 +315,7 @@ class SkippyApp:
             with dpg.menu(label="Tools"):
                 dpg.add_menu_item(label="Refresh models", callback=lambda: self.refresh_models())
                 dpg.add_menu_item(label="Cancel current", callback=lambda: self.cancel())
+                dpg.add_menu_item(label="Clear conversation", callback=lambda: self._clear_conv_callback())
             with dpg.menu(label="Help"):
                 dpg.add_menu_item(label="About", callback=self._about_modal)
 
@@ -271,8 +336,12 @@ class SkippyApp:
                     self.ids["ptt_btn"] = dpg.add_button(label="Hold to talk (or use hotkey)", width=360)
                     dpg.bind_item_handler_registry(self.ids["ptt_btn"], self._ptt_mouse_handlers())
                     self.ids["cancel_btn"] = dpg.add_button(label="Cancel", width=120, callback=lambda: self.cancel())
-                    self.ids["stream_chk"] = dpg.add_checkbox(label="Stream reply", default_value=self.state.stream, callback=self._toggle_stream)
-                    self.ids["temp_slider"] = dpg.add_slider_float(label="Temp", min_value=0.0, max_value=1.2, default_value=self.state.temperature, width=220, callback=self._set_temp)
+                    self.ids["clear_btn"] = dpg.add_button(label="Clear", width=80, callback=lambda: self._clear_conv_callback())
+                    with self._lock:
+                        stream_val = self.state.stream
+                        temp_val = self.state.temperature
+                    self.ids["stream_chk"] = dpg.add_checkbox(label="Stream reply", default_value=stream_val, callback=self._toggle_stream)
+                    self.ids["temp_slider"] = dpg.add_slider_float(label="Temp", min_value=0.0, max_value=1.2, default_value=temp_val, width=220, callback=self._set_temp)
 
             # RIGHT: settings
             with dpg.child_window(width=-1, height=-1, border=True):
@@ -301,6 +370,12 @@ class SkippyApp:
                 self.ids["ptt_key"] = dpg.add_input_text(label="Hotkey", default_value=self.cfg.audio.ptt_key, width=-1, readonly=True)
                 dpg.add_text("Change hotkey in config/default.toml (audio.ptt_key)")
 
+                dpg.add_spacer(height=6)
+                dpg.add_text("Audio Devices")
+                devices = self._get_device_names()
+                self.ids["device_in"] = dpg.add_combo(label="Input", items=devices["input"], default_value=self.cfg.audio.device_in, width=-1, callback=self._set_device_in)
+                self.ids["device_out"] = dpg.add_combo(label="Output", items=devices["output"], default_value=self.cfg.audio.device_out, width=-1, callback=self._set_device_out)
+
         # Seed chat with persona line for clarity
         self._add_log("Skippy", "Ready. Hold the button or PTT hotkey and speak.")
 
@@ -315,11 +390,19 @@ class SkippyApp:
         return reg
 
     # ---------------- Callbacks ----------------
+    def _clear_conv_callback(self):
+        self._clear_messages()
+        dpg.delete_item(self.ids["chat_log"], children_only=True)
+        self._add_log("Skippy", "Conversation cleared.")
+        self._set_status("Ready")
+
     def _toggle_stream(self, sender, app_data):
-        self.state.stream = bool(app_data)
+        with self._lock:
+            self.state.stream = bool(app_data)
 
     def _set_temp(self, sender, app_data):
-        self.state.temperature = float(app_data)
+        with self._lock:
+            self.state.temperature = float(app_data)
 
     def _set_llm(self, sender, app_data):
         self.cfg.models.llm = str(app_data)
@@ -333,6 +416,27 @@ class SkippyApp:
     def _set_tts_endpoint(self, sender, app_data):
         self.cfg.models.tts_endpoint = str(app_data)
 
+    def _set_device_in(self, sender, app_data):
+        self.cfg.audio.device_in = str(app_data)
+        self.recorder.device = device_by_name(self.cfg.audio.device_in, kind="input")
+
+    def _set_device_out(self, sender, app_data):
+        self.cfg.audio.device_out = str(app_data)
+        self.out_device = device_by_name(self.cfg.audio.device_out, kind="output")
+
+    def _get_device_names(self) -> Dict[str, List[str]]:
+        import sounddevice as sd
+        devices = sd.query_devices()
+        input_devs = []
+        output_devs = []
+        for d in devices:
+            name = d.get("name", "Unknown")
+            if d.get("max_input_channels", 0) > 0:
+                input_devs.append(name)
+            if d.get("max_output_channels", 0) > 0:
+                output_devs.append(name)
+        return {"input": sorted(set(input_devs)), "output": sorted(set(output_devs))}
+
     def _persona_path_changed(self, sender, app_data):
         # Don't live-write to disk; just load if exists.
         try:
@@ -340,16 +444,22 @@ class SkippyApp:
             if p.exists():
                 self.persona_text = p.read_text(encoding="utf-8").strip()
                 dpg.set_value(self.ids["persona_text"], self.persona_text)
-                self.state.messages[0] = {"role": "system", "content": self.persona_text}
+                with self._lock:
+                    if self.state.messages and self.state.messages[0].get("role") == "system":
+                        self.state.messages[0]["content"] = self.persona_text
+                    else:
+                        self.state.messages.insert(0, {"role": "system", "content": self.persona_text})
                 self._set_status("Persona loaded")
         except Exception as e:
             self._set_status(f"Persona load error: {e}")
+            self._show_error("Persona Load Error", str(e))
 
     def _persona_text_changed(self, sender, app_data):
         # Live-update system prompt in memory
         self.persona_text = str(app_data)
-        if self.state.messages and self.state.messages[0].get("role") == "system":
-            self.state.messages[0]["content"] = self.persona_text
+        with self._lock:
+            if self.state.messages and self.state.messages[0].get("role") == "system":
+                self.state.messages[0]["content"] = self.persona_text
 
     def _reload_config(self) -> None:
         if not self.cfg.config_path:
@@ -360,7 +470,8 @@ class SkippyApp:
             self.cfg = new_cfg
             self.client = LocalAIClient(new_cfg.localai.base_url, timeout_s=new_cfg.localai.timeout_s)
             self.persona_text = read_persona_text(new_cfg)
-            self.state = ChatState(messages=[{"role": "system", "content": self.persona_text}])
+            with self._lock:
+                self.state = ChatState(messages=[{"role": "system", "content": self.persona_text}])
             self.recorder = Recorder(
                 sample_rate=new_cfg.audio.sample_rate,
                 channels=new_cfg.audio.channels,
@@ -376,6 +487,22 @@ class SkippyApp:
             self.refresh_models()
         except Exception as e:
             self._set_status(f"Config reload error: {e}")
+            self._show_error("Config Reload Error", str(e))
+
+    def _error_modal(self, title: str, message: str) -> None:
+        win_id = dpg.generate_uuid()
+        with dpg.window(
+            label=title,
+            modal=True,
+            no_resize=True,
+            width=500,
+            height=-1,
+            pos=(300, 200),
+            tag=win_id,
+        ):
+            dpg.add_text(message, wrap=480)
+            dpg.add_spacer(height=10)
+            dpg.add_button(label="OK", width=120, callback=lambda: dpg.delete_item(win_id))
 
     def _about_modal(self) -> None:
         win_id = dpg.generate_uuid()
@@ -429,6 +556,8 @@ class SkippyApp:
                 self._update_stream_bubble(str(payload))
             elif op == "assistant_finalize_stream":
                 self._finalize_stream_bubble(str(payload))
+            elif op == "error_modal":
+                self._error_modal(payload["title"], payload["message"])
 
     def _append_chat_bubble(self, who: str, text: str) -> None:
         parent = self.ids["chat_log"]
