@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -38,6 +38,7 @@ class AudioConfig:
     device_out: str = ""
     ptt_key: str = "SHIFT_R"
     max_record_seconds: int = 30
+    volume: float = 1.0
 
 
 @dataclass
@@ -63,6 +64,15 @@ class AppConfig:
 
     root_dir: Path = Path.cwd()
     config_path: Optional[Path] = None
+
+    def save(self, path: Optional[Path | str] = None) -> None:
+        import tomli_w
+        p = Path(path or self.config_path).expanduser().resolve()
+        data = asdict(self)
+        # Remove fields that shouldn't be in the TOML
+        data.pop("root_dir", None)
+        data.pop("config_path", None)
+        p.write_text(tomli_w.dumps(data), encoding="utf-8")
 
 
 def _get(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -107,6 +117,7 @@ def load_config(path: str | Path) -> AppConfig:
     cfg.audio.device_out = str(_get(data, "audio", "device_out", default=cfg.audio.device_out))
     cfg.audio.ptt_key = str(_get(data, "audio", "ptt_key", default=cfg.audio.ptt_key))
     cfg.audio.max_record_seconds = int(_get(data, "audio", "max_record_seconds", default=cfg.audio.max_record_seconds))
+    cfg.audio.volume = float(_get(data, "audio", "volume", default=cfg.audio.volume))
 
     cfg.ui.theme = str(_get(data, "ui", "theme", default=cfg.ui.theme))
     cfg.ui.font_size = int(_get(data, "ui", "font_size", default=cfg.ui.font_size))
