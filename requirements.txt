@@ -1,5 +1,6 @@
 dearpygui>=1.11.1
 requests>=2.31.0
+langgraph>=0.2.0
 numpy>=1.26.0
 sounddevice>=0.4.6
 soundfile>=0.12.1
