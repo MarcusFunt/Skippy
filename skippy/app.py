@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import dearpygui.dearpygui as dpg
 
+from .agent_graph import SkippyAgentGraph
 from .audio import Recorder, device_by_name, play_audio, stop_playback
 from .config import AppConfig, load_config, read_persona_text
 from .localai_client import LocalAIClient
@@ -51,6 +52,7 @@ class SkippyApp:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
         self.client = LocalAIClient(cfg.localai.base_url, timeout_s=cfg.localai.timeout_s)
+        self.agent = SkippyAgentGraph(self.client)
 
         self.persona_text = read_persona_text(cfg)
         self.state = ChatState(messages=[{"role": "system", "content": self.persona_text}])
@@ -173,35 +175,38 @@ class SkippyApp:
             # LLM
             self._set_status("Thinking…")
             assistant_text = ""
-
             messages = self._get_messages()
 
             if stream:
                 self._enqueue("assistant_new_stream", None)
-                for chunk in self.client.chat_stream(
-                    model=llm_model,
-                    messages=messages,
-                    temperature=temp,
-                ):
-                    with self._lock:
-                        if self.state.cancel_flag:
-                            break
-                    assistant_text += chunk
-                    self._set_assistant_stream_text(assistant_text)
-                assistant_text = assistant_text.strip()
+
+            def stream_callback(text: str) -> None:
+                self._set_assistant_stream_text(text)
+
+            def cancel_check() -> bool:
+                with self._lock:
+                    return self.state.cancel_flag
+
+            assistant_text = self.agent.run(
+                model=llm_model,
+                messages=messages,
+                temperature=temp,
+                stream=stream,
+                stream_callback=stream_callback if stream else None,
+                cancel_check=cancel_check,
+            )
+
+            with self._lock:
+                if self.state.cancel_flag:
+                    return
+
+            assistant_text = assistant_text.strip()
+            if stream:
                 if assistant_text:
-                    # finalize log entry
                     self._enqueue("assistant_finalize_stream", assistant_text)
             else:
-                assistant_text = self.client.chat(
-                    model=llm_model,
-                    messages=messages,
-                    temperature=temp,
-                )
-                with self._lock:
-                    if self.state.cancel_flag:
-                        return
-                self._add_log("Skippy", assistant_text)
+                if assistant_text:
+                    self._add_log("Skippy", assistant_text)
 
             if not assistant_text:
                 self._set_status("No assistant response")
@@ -501,6 +506,7 @@ class SkippyApp:
             new_cfg = load_config(self.cfg.config_path)
             self.cfg = new_cfg
             self.client = LocalAIClient(new_cfg.localai.base_url, timeout_s=new_cfg.localai.timeout_s)
+            self.agent = SkippyAgentGraph(self.client)
             self.persona_text = read_persona_text(new_cfg)
             with self._lock:
                 self.state = ChatState(messages=[{"role": "system", "content": self.persona_text}])
